@@ -1,0 +1,23 @@
+# configs/preprocess_isic.yaml
+
+dataset:
+  # image_dir: "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Training_Input"
+  # csv_path: "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Training_GroundTruth/ISIC2018_Task3_Training_GroundTruth.csv"
+  # output_dir: "/mnt/data0/cyb/ISIC/isic2018_latents_256"
+
+  image_dir: "/mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw"
+  csv_path: "/mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw/train_amplified.csv"
+  output_dir: "/mnt/data0/cyb/ISIC/isic2018_fewshot_10_latents_256"
+  
+  # 图像预处理参数
+  resolution: 256             # Resize到 256x256
+  ext: ".jpg"                 # 图片后缀
+
+vae:
+  # 使用 Stable Diffusion 的官方微调 VAE
+  model_id: "stabilityai/sd-vae-ft-mse"
+  # 缩放因子，SD VAE 的标准参数
+  scaling_factor: 0.18215
+  batch_size: 32              # VAE 推理的 batch size
+  num_workers: 8              # DataLoader 线程数
+  device: "cuda"

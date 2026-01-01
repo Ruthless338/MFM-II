@@ -94,69 +94,81 @@ def rand_linear(z1, z2, alpha=None):
 class FlowODESolver:
     """
     Flow Matching 的核心：ODE 求解器
-    支持正向生成 (0 -> 1) 和反向 Inversion (1 -> 0)
+    - Inversion: t=1 -> 0（建议不使用 CFG）
+    - Sampling : t=0 -> 1（可使用 CFG）
+    数值积分：Heun（二阶预测-校正），通常比 Euler 更稳、同步数质量更好
     """
     def __init__(self, model, num_steps=50, device="cuda"):
         self.model = model
         self.num_steps = num_steps
         self.device = device
-        
+
     @torch.no_grad()
-    def step(self, x, t, y, dt):
-        # """
-        # Euler 方法单步积分: x_{t+dt} = x_t + v(x_t, t) * dt
-        # """
-        # # 广播时间 t
-        # t_tensor = torch.ones(x.shape[0], device=self.device) * t
-        
-        # # 预测速度场 v
-        # v_pred = self.model(x, t_tensor, y)
-        
-        # # 更新 x
-        # x_new = x + v_pred * dt
-        # return x_new
+    def _predict_v(self, x, t_scalar, y, cfg_scale: float = 1.0):
         """
-        Heun Step
+        预测速度场 v(x,t|y)
+        CFG 形式：
+            v = v_uncond + s * (v_cond - v_uncond)
+        其中 uncond 的 label 使用 null token id = num_classes
         """
-        t0 = torch.ones(x.shape[0], device=self.device) * t
-        v0 = self.model(x, t0, y)
+        t = torch.ones(x.shape[0], device=self.device) * float(t_scalar)
 
+        # 不启用 CFG：直接条件预测
+        if cfg_scale is None or float(cfg_scale) == 1.0:
+            return self.model(x, t, y)
+
+        null_id = getattr(self.model, "num_classes", None)
+        if null_id is None:
+            raise AttributeError("Model must have attribute `num_classes` for CFG null label id.")
+
+        y_null = torch.full_like(y, fill_value=null_id)
+
+        v_uncond = self.model(x, t, y_null)
+        v_cond = self.model(x, t, y)
+
+        s = float(cfg_scale)
+        return v_uncond + s * (v_cond - v_uncond)
+
+    @torch.no_grad()
+    def step(self, x, t, y, dt, cfg_scale: float = 1.0):
+        """
+        Heun (Improved Euler / predictor-corrector):
+          v0 = v(x_t, t)
+          x_euler = x_t + v0 * dt
+          v1 = v(x_euler, t+dt)
+          x_{t+dt} = x_t + 0.5*(v0+v1)*dt
+        """
+        v0 = self._predict_v(x, t, y, cfg_scale=cfg_scale)
         x_euler = x + v0 * dt
-        t1 = torch.ones(x.shape[0], device=self.device) * (t + dt)
-        v1 = self.model(x_euler, t1, y)
-
+        v1 = self._predict_v(x_euler, t + dt, y, cfg_scale=cfg_scale)
         return x + 0.5 * (v0 + v1) * dt
 
     @torch.no_grad()
     def invert(self, latents, y):
         """
         Inversion: Real Data (t=1) -> Gaussian Noise (t=0)
-        这是 Diff-II 的 DDIM Inversion 的 Flow Matching 版本。
-        因为 FM 轨迹是直的，所以这里的 Inversion 误差比 Diffusion 小得多。
+        通常 inversion 不开 CFG（cfg_scale=1）
         """
         x = latents.clone()
-        dt = -1.0 / self.num_steps # 时间倒流
-        
-        # 从 t=1 积分到 t=0
+        dt = -1.0 / self.num_steps
+
         for i in range(self.num_steps):
-            t = 1.0 + i * dt 
-            x = self.step(x, t, y, dt)
-            
-        return x 
+            t = 1.0 + i * dt
+            x = self.step(x, t, y, dt, cfg_scale=1.0)
+        return x
 
     @torch.no_grad()
-    def sample(self, noise, y):
+    def sample(self, noise, y, cfg_scale: float = 1.0):
         """
         Generation: Gaussian Noise (t=0) -> Synthetic Data (t=1)
+        可开启 CFG
         """
         x = noise.clone()
-        dt = 1.0 / self.num_steps # 时间正向
-        
-        # 从 t=0 积分到 t=1
+        dt = 1.0 / self.num_steps
+
         for i in range(self.num_steps):
             t = 0.0 + i * dt
-            x = self.step(x, t, y, dt)
-            
+            x = self.step(x, t, y, dt, cfg_scale=cfg_scale)
         return x
 
 # -----------------------------------------------------------------------------
@@ -221,6 +233,7 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--interpolation_mode", type=str, default="Slerp", choices=["Slerp", "Linear"], help="Interpolation Comparison modes")
+    parser.add_argument("--cfg_scale", type=float, default=1.8, help="Classifier-Free Guidance scale (1.0 = no CFG)")
 
     args = parser.parse_args()
 
@@ -315,7 +328,7 @@ def main():
                 z_mix_noise = rand_slerp(z1_noise, z2_noise)
             
             # --- Step D: Generation (Noise -> Synthetic Data) ---
-            z_aug = solver.sample(z_mix_noise, y_batch)
+            z_aug = solver.sample(z_mix_noise, y_batch, cfg_scale=args.cfg_scale)
             
             # --- Step E: VAE Decode & Save ---
             with torch.no_grad():

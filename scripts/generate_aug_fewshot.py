@@ -103,18 +103,29 @@ class FlowODESolver:
         
     @torch.no_grad()
     def step(self, x, t, y, dt):
-        """
-        Euler 方法单步积分: x_{t+dt} = x_t + v(x_t, t) * dt
-        """
-        # 广播时间 t
-        t_tensor = torch.ones(x.shape[0], device=self.device) * t
+        # """
+        # Euler 方法单步积分: x_{t+dt} = x_t + v(x_t, t) * dt
+        # """
+        # # 广播时间 t
+        # t_tensor = torch.ones(x.shape[0], device=self.device) * t
         
-        # 预测速度场 v
-        v_pred = self.model(x, t_tensor, y)
+        # # 预测速度场 v
+        # v_pred = self.model(x, t_tensor, y)
         
-        # 更新 x
-        x_new = x + v_pred * dt
-        return x_new
+        # # 更新 x
+        # x_new = x + v_pred * dt
+        # return x_new
+        """
+        Heun Step
+        """
+        t0 = torch.ones(x.shape[0], device=self.device) * t
+        v0 = self.model(x, t0, y)
+
+        x_euler = x + v0 * dt
+        t1 = torch.ones(x.shape[0], device=self.device) * (t + dt)
+        v1 = self.model(x_euler, t1, y)
+
+        return x + 0.5 * (v0 + v1) * dt
 
     @torch.no_grad()
     def invert(self, latents, y):
@@ -253,7 +264,7 @@ def main():
     all_classes = sorted(list(class_buckets.keys()))
     
     # 动态 GPU 分配：简单的取模分配
-    my_classes = [c+1 for c in all_classes if c % torch.cuda.device_count() == args.device_id] if torch.cuda.device_count() > 1 else all_classes
+    my_classes = [c for c in all_classes if c % torch.cuda.device_count() == args.device_id] if torch.cuda.device_count() > 1 else all_classes
     
     print(f"GPU {args.device_id} processing classes: {my_classes}")
 

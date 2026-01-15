@@ -33,6 +33,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.dit import DiT
 from data.dataset import ISICLatentDataset
+from utils.knn import build_latent_features, precompute_knn_table, sample_knn_pairs
 
 # -----------------------------------------------------------------------------
 # 1. 数学核心工具 (Math Utils)
@@ -233,7 +234,16 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--interpolation_mode", type=str, default="Slerp", choices=["Slerp", "Linear"], help="Interpolation Comparison modes")
-    parser.add_argument("--cfg_scale", type=float, default=1.8, help="Classifier-Free Guidance scale (1.0 = no CFG)")
+    parser.add_argument("--cfg_scale", type=float, default=1.3, help="Classifier-Free Guidance scale (1.0 = no CFG)")
+    parser.add_argument("--pairing_mode", type=str, default="knn", choices=["random", "knn"])
+    parser.add_argument("--nn_k", type=int, default=64, help="Top-k neighbors per sample for mixing")
+    parser.add_argument("--nn_pool", type=int, default=8, help="Adaptive avg pool size for feature: 4*pool*pool dims")
+    parser.add_argument("--nn_chunk", type=int, default=512, help="Chunk size for KNN precompute matmul")
+    parser.add_argument("--nn_temperature", type=float, default=0.2, help="Softmax temperature over neighbor sims")
+    parser.add_argument("--nn_min_sim", type=float, default=-1.0, help="If max neighbor sim < this, fallback to random")
+    parser.add_argument("--nn_max_sim", type=float, default=0.999, help="Filter neighbors with sim > this (near-duplicates)")
+    parser.add_argument("--nn_mutual", action="store_true", help="Use mutual-kNN constraint (stricter manifold locality)")
+    parser.add_argument("--nn_device", type=str, default="cuda", choices=["cuda", "cpu"], help="Where to store knn tables")
 
     args = parser.parse_args()
 
@@ -281,6 +291,31 @@ def main():
     
     print(f"GPU {args.device_id} processing classes: {my_classes}")
 
+    knn_tables = {}
+
+    if args.pairing_mode == "knn":
+        print("Building kNN tables per class for manifold-constrained mixing...")
+        table_device = device if args.nn_device == "cuda" else torch.device("cpu")
+
+        for c_idx in my_classes:
+            latents_c = class_buckets[c_idx]  # [N,4,32,32]
+            N = latents_c.shape[0]
+            if N < 2:
+                print(f"Class {c_idx}: N={N} < 2, skip kNN.")
+                continue
+
+            feat = build_latent_features(latents_c, pool=args.nn_pool)  # [N,D] on GPU
+            knn_idx, knn_sim = precompute_knn_table(
+                feat=feat,
+                k=args.nn_k,
+                chunk=args.nn_chunk,
+                max_sim=args.nn_max_sim,
+                device_for_tables=("cuda" if table_device == device else "cpu"),
+            )
+            knn_tables[c_idx] = (knn_idx, knn_sim)
+            print(f"Class {c_idx}: kNN table ready. N={N}, k={knn_idx.shape[1]}, feat_dim={feat.shape[1]}")
+
+
     for c_idx in my_classes:
         latents = class_buckets[c_idx]
         current_count = len(latents)
@@ -307,8 +342,25 @@ def main():
             
             # --- Step A: Random Pairing from Amplified Pool ---
             # 因为池子变大了，随机配对的组合指数级增加，这就是 Seed Amplification 的意义
-            idx1 = torch.randint(0, len(latents), (curr_bs,), device=device)
-            idx2 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            # idx1 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            # idx2 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            N = latents.shape[0]
+
+            if args.pairing_mode == "knn" and c_idx in knn_tables and N >= 2:
+                knn_idx, knn_sim = knn_tables[c_idx]
+                idx1, idx2 = sample_knn_pairs(
+                    N=N,
+                    knn_idx=knn_idx,
+                    knn_sim=knn_sim,
+                    batch_size=curr_bs,
+                    device=torch.device(device),
+                    temperature=args.nn_temperature,
+                    min_sim=args.nn_min_sim,
+                    mutual=args.nn_mutual,
+                )
+            else:
+                idx1 = torch.randint(0, N, (curr_bs,), device=device)
+                idx2 = torch.randint(0, N, (curr_bs,), device=device)
             
             z1_real = latents[idx1]
             z2_real = latents[idx2]

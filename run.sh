@@ -65,9 +65,10 @@ HF_ENDPOINT=https://hf-mirror.com python scripts/generate_aug_fewshot.py \
   --data_dir /mnt/data0/cyb/ISIC/isic2018_fewshot_10_latents_256 \
   --train_csv /mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw/train_amplified.csv \
   --output_dir /mnt/data0/cyb/ISIC/isic_fewshot_10_augmented_256 \
+  --pairing_mode knn --nn_k 64 --nn_pool 8 --nn_temperature 0.25 --nn_max_sim 0.999 --nn_min_sim 0.2 \
   --target_count 536 \
-  --device 0 \
-  --interpolation_mode Slerp
+  --interpolation_mode Slerp \
+  --device 0
 
 python scripts/train_classifier.py \
   --exp_name "Exp3_Baseline_Real10_amplified" \
@@ -111,7 +112,7 @@ python scripts/inference_classifier.py \
   --output_dir "results/inference_classifier/ISIC/Exp3"
 
 python scripts/inference_classifier.py \
-  --ckpt_path "/home/chenyibiao/MFM-II/checkpoints/classifier/Exp4_FewShot_10_with_Aug/best-epoch=48-val/f1_macro=0.4527.ckpt" \
+  --ckpt_path "/home/chenyibiao/MFM-II/checkpoints/classifier/Exp4_FewShot_10_with_Aug/last-v2.ckpt" \
   --test_img_dir "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_Input" \
   --test_csv "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_GroundTruth/ISIC2018_Task3_Test_GroundTruth.csv" \
   --output_dir "results/inference_classifier/ISIC/Exp4"
@@ -144,3 +145,30 @@ python scripts/inference_classifier.py \
   --test_img_dir "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_Input" \
   --test_csv "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_GroundTruth/ISIC2018_Task3_Test_GroundTruth.csv" \
   --output_dir "results/inference_classifier/ISIC/Exp5"
+
+# Exp6 noise_start
+HF_ENDPOINT=https://hf-mirror.com python scripts/generate_aug_fewshot_noise_start.py \
+  --ckpt /home/chenyibiao/MFM-II/checkpoints/isic_fm_dit_v2/epoch=384-val/loss=1.7222.ckpt \
+  --data_dir /mnt/data0/cyb/ISIC/isic2018_fewshot_10_latents_256 \
+  --train_csv /mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw/train_amplified.csv \
+  --output_dir /mnt/data0/cyb/ISIC/isic_fewshot_10_augmented_256_noise_start \
+  --target_count 536 \
+  --device 0
+
+python scripts/train_classifier.py \
+  --exp_name "Exp6_FewShot_10_with_Aug_noise_start" \
+  --use_synthetic \
+  --syn_data_dir "/mnt/data0/cyb/ISIC/isic_fewshot_10_augmented_256_noise_start" \
+  --real_img_dir "/mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw" \
+  --train_csv "/mnt/data0/cyb/ISIC/isic2018_fewshot_10_raw/train_amplified.csv" \
+  --val_csv "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Training_GroundTruth/val_split.csv" \
+  --val_img_dir "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Training_Input" \
+  --devices 4 \
+  --batch_size 512 \
+  --epochs 50
+
+python scripts/inference_classifier.py \
+  --ckpt_path "/home/chenyibiao/MFM-II/checkpoints/classifier/Exp6_FewShot_10_with_Aug_noise_start/best-epoch=49-val/f1_macro=0.4627.ckpt" \
+  --test_img_dir "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_Input" \
+  --test_csv "/mnt/data0/cyb/ISIC/ISIC2018_Task3_Test_GroundTruth/ISIC2018_Task3_Test_GroundTruth.csv" \
+  --output_dir "results/inference_classifier/ISIC/Exp6"

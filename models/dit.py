@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
-from timm.models.vision_transformer import Mlp, PatchEmbed, Attention
+from timm.models.vision_transformer import Mlp, PatchEmbed
+import torch.nn.functional as F
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -53,12 +54,43 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+class SDPAAttention(nn.Module):
+    """
+    使用 PyTorch scaled_dot_product_attention（PyTorch>=2.0）
+    在支持的 GPU/环境下会自动走 Flash / Mem-Efficient kernel。
+    输入输出: [B, N, C]
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=True, proj_bias=True):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x)  # [B, N, 3C]
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, H, N, D]
+
+        # 尽量使用更快 kernel（如果当前 PyTorch/驱动支持会生效）
+        if q.is_cuda and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+
+        out = out.transpose(1, 2).reshape(B, N, C)  # [B, N, C]
+        out = self.proj(out)
+        return out
+
 class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        # 显式使用 PyTorch 2.0 的 scaled_dot_product_attention 以启用 Flash Attention
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **kwargs)
+        self.attn = SDPAAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0)

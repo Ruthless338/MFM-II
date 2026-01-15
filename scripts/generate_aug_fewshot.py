@@ -33,6 +33,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.dit import DiT
 from data.dataset import ISICLatentDataset
+from utils.knn import build_latent_features, precompute_knn_table, sample_knn_pairs
 
 # -----------------------------------------------------------------------------
 # 1. 数学核心工具 (Math Utils)
@@ -94,58 +95,81 @@ def rand_linear(z1, z2, alpha=None):
 class FlowODESolver:
     """
     Flow Matching 的核心：ODE 求解器
-    支持正向生成 (0 -> 1) 和反向 Inversion (1 -> 0)
+    - Inversion: t=1 -> 0（建议不使用 CFG）
+    - Sampling : t=0 -> 1（可使用 CFG）
+    数值积分：Heun（二阶预测-校正），通常比 Euler 更稳、同步数质量更好
     """
     def __init__(self, model, num_steps=50, device="cuda"):
         self.model = model
         self.num_steps = num_steps
         self.device = device
-        
+
     @torch.no_grad()
-    def step(self, x, t, y, dt):
+    def _predict_v(self, x, t_scalar, y, cfg_scale: float = 1.0):
         """
-        Euler 方法单步积分: x_{t+dt} = x_t + v(x_t, t) * dt
+        预测速度场 v(x,t|y)
+        CFG 形式：
+            v = v_uncond + s * (v_cond - v_uncond)
+        其中 uncond 的 label 使用 null token id = num_classes
         """
-        # 广播时间 t
-        t_tensor = torch.ones(x.shape[0], device=self.device) * t
-        
-        # 预测速度场 v
-        v_pred = self.model(x, t_tensor, y)
-        
-        # 更新 x
-        x_new = x + v_pred * dt
-        return x_new
+        t = torch.ones(x.shape[0], device=self.device) * float(t_scalar)
+
+        # 不启用 CFG：直接条件预测
+        if cfg_scale is None or float(cfg_scale) == 1.0:
+            return self.model(x, t, y)
+
+        null_id = getattr(self.model, "num_classes", None)
+        if null_id is None:
+            raise AttributeError("Model must have attribute `num_classes` for CFG null label id.")
+
+        y_null = torch.full_like(y, fill_value=null_id)
+
+        v_uncond = self.model(x, t, y_null)
+        v_cond = self.model(x, t, y)
+
+        s = float(cfg_scale)
+        return v_uncond + s * (v_cond - v_uncond)
+
+    @torch.no_grad()
+    def step(self, x, t, y, dt, cfg_scale: float = 1.0):
+        """
+        Heun (Improved Euler / predictor-corrector):
+          v0 = v(x_t, t)
+          x_euler = x_t + v0 * dt
+          v1 = v(x_euler, t+dt)
+          x_{t+dt} = x_t + 0.5*(v0+v1)*dt
+        """
+        v0 = self._predict_v(x, t, y, cfg_scale=cfg_scale)
+        x_euler = x + v0 * dt
+        v1 = self._predict_v(x_euler, t + dt, y, cfg_scale=cfg_scale)
+        return x + 0.5 * (v0 + v1) * dt
 
     @torch.no_grad()
     def invert(self, latents, y):
         """
         Inversion: Real Data (t=1) -> Gaussian Noise (t=0)
-        这是 Diff-II 的 DDIM Inversion 的 Flow Matching 版本。
-        因为 FM 轨迹是直的，所以这里的 Inversion 误差比 Diffusion 小得多。
+        通常 inversion 不开 CFG（cfg_scale=1）
         """
         x = latents.clone()
-        dt = -1.0 / self.num_steps # 时间倒流
-        
-        # 从 t=1 积分到 t=0
+        dt = -1.0 / self.num_steps
+
         for i in range(self.num_steps):
-            t = 1.0 + i * dt 
-            x = self.step(x, t, y, dt)
-            
-        return x 
+            t = 1.0 + i * dt
+            x = self.step(x, t, y, dt, cfg_scale=1.0)
+        return x
 
     @torch.no_grad()
-    def sample(self, noise, y):
+    def sample(self, noise, y, cfg_scale: float = 1.0):
         """
         Generation: Gaussian Noise (t=0) -> Synthetic Data (t=1)
+        可开启 CFG
         """
         x = noise.clone()
-        dt = 1.0 / self.num_steps # 时间正向
-        
-        # 从 t=0 积分到 t=1
+        dt = 1.0 / self.num_steps
+
         for i in range(self.num_steps):
             t = 0.0 + i * dt
-            x = self.step(x, t, y, dt)
-            
+            x = self.step(x, t, y, dt, cfg_scale=cfg_scale)
         return x
 
 # -----------------------------------------------------------------------------
@@ -210,6 +234,16 @@ def main():
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--interpolation_mode", type=str, default="Slerp", choices=["Slerp", "Linear"], help="Interpolation Comparison modes")
+    parser.add_argument("--cfg_scale", type=float, default=1.3, help="Classifier-Free Guidance scale (1.0 = no CFG)")
+    parser.add_argument("--pairing_mode", type=str, default="knn", choices=["random", "knn"])
+    parser.add_argument("--nn_k", type=int, default=64, help="Top-k neighbors per sample for mixing")
+    parser.add_argument("--nn_pool", type=int, default=8, help="Adaptive avg pool size for feature: 4*pool*pool dims")
+    parser.add_argument("--nn_chunk", type=int, default=512, help="Chunk size for KNN precompute matmul")
+    parser.add_argument("--nn_temperature", type=float, default=0.2, help="Softmax temperature over neighbor sims")
+    parser.add_argument("--nn_min_sim", type=float, default=-1.0, help="If max neighbor sim < this, fallback to random")
+    parser.add_argument("--nn_max_sim", type=float, default=0.999, help="Filter neighbors with sim > this (near-duplicates)")
+    parser.add_argument("--nn_mutual", action="store_true", help="Use mutual-kNN constraint (stricter manifold locality)")
+    parser.add_argument("--nn_device", type=str, default="cuda", choices=["cuda", "cpu"], help="Where to store knn tables")
 
     args = parser.parse_args()
 
@@ -253,9 +287,34 @@ def main():
     all_classes = sorted(list(class_buckets.keys()))
     
     # 动态 GPU 分配：简单的取模分配
-    my_classes = [c+1 for c in all_classes if c % torch.cuda.device_count() == args.device_id] if torch.cuda.device_count() > 1 else all_classes
+    my_classes = [c for c in all_classes if c % torch.cuda.device_count() == args.device_id] if torch.cuda.device_count() > 1 else all_classes
     
     print(f"GPU {args.device_id} processing classes: {my_classes}")
+
+    knn_tables = {}
+
+    if args.pairing_mode == "knn":
+        print("Building kNN tables per class for manifold-constrained mixing...")
+        table_device = device if args.nn_device == "cuda" else torch.device("cpu")
+
+        for c_idx in my_classes:
+            latents_c = class_buckets[c_idx]  # [N,4,32,32]
+            N = latents_c.shape[0]
+            if N < 2:
+                print(f"Class {c_idx}: N={N} < 2, skip kNN.")
+                continue
+
+            feat = build_latent_features(latents_c, pool=args.nn_pool)  # [N,D] on GPU
+            knn_idx, knn_sim = precompute_knn_table(
+                feat=feat,
+                k=args.nn_k,
+                chunk=args.nn_chunk,
+                max_sim=args.nn_max_sim,
+                device_for_tables=("cuda" if table_device == device else "cpu"),
+            )
+            knn_tables[c_idx] = (knn_idx, knn_sim)
+            print(f"Class {c_idx}: kNN table ready. N={N}, k={knn_idx.shape[1]}, feat_dim={feat.shape[1]}")
+
 
     for c_idx in my_classes:
         latents = class_buckets[c_idx]
@@ -283,8 +342,25 @@ def main():
             
             # --- Step A: Random Pairing from Amplified Pool ---
             # 因为池子变大了，随机配对的组合指数级增加，这就是 Seed Amplification 的意义
-            idx1 = torch.randint(0, len(latents), (curr_bs,), device=device)
-            idx2 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            # idx1 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            # idx2 = torch.randint(0, len(latents), (curr_bs,), device=device)
+            N = latents.shape[0]
+
+            if args.pairing_mode == "knn" and c_idx in knn_tables and N >= 2:
+                knn_idx, knn_sim = knn_tables[c_idx]
+                idx1, idx2 = sample_knn_pairs(
+                    N=N,
+                    knn_idx=knn_idx,
+                    knn_sim=knn_sim,
+                    batch_size=curr_bs,
+                    device=torch.device(device),
+                    temperature=args.nn_temperature,
+                    min_sim=args.nn_min_sim,
+                    mutual=args.nn_mutual,
+                )
+            else:
+                idx1 = torch.randint(0, N, (curr_bs,), device=device)
+                idx2 = torch.randint(0, N, (curr_bs,), device=device)
             
             z1_real = latents[idx1]
             z2_real = latents[idx2]
@@ -304,7 +380,7 @@ def main():
                 z_mix_noise = rand_slerp(z1_noise, z2_noise)
             
             # --- Step D: Generation (Noise -> Synthetic Data) ---
-            z_aug = solver.sample(z_mix_noise, y_batch)
+            z_aug = solver.sample(z_mix_noise, y_batch, cfg_scale=args.cfg_scale)
             
             # --- Step E: VAE Decode & Save ---
             with torch.no_grad():
